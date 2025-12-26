@@ -1,0 +1,6 @@
+streamlit==1.35.0
+sqlalchemy==2.0.23
+pymysql==1.1.0
+pandas==2.1.4
+plotly==5.18.0
+python-dotenv==1.0.0
