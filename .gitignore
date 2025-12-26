@@ -4,6 +4,10 @@ __pycache__/
 *$py.class
 *.so
 .Python
+
+# Database files (not suitable for cloud deployment)
+*.db
+gps_ledger.db
 build/
 develop-eggs/
 dist/

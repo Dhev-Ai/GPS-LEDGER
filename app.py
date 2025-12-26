@@ -2,15 +2,16 @@ import os
 import datetime as dt
 from typing import List, Optional
 import hashlib
+import pathlib
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 import streamlit as st
 
-load_dotenv()
+# Database path for SQLite
+DB_PATH = pathlib.Path(__file__).parent / "gps_ledger.db"
 
 st.set_page_config(
     page_title="GPS Ledger · Expense Studio",
@@ -24,8 +25,8 @@ ACCENT_COLOR = "#0ea5e9"
 BACKGROUND_GRADIENT = "linear-gradient(135deg, #0f172a 0%, #1d1b52 50%, #0b1120 100%)"
 CURRENCY = "₹"  # Indian Rupees
 
-# Default categories for new users
-DEFAULT_CATEGORIES = [
+# Default expense categories
+DEFAULT_EXPENSE_CATEGORIES = [
     "🍔 Food & Dining",
     "🛒 Shopping",
     "🚗 Transport",
@@ -43,6 +44,26 @@ DEFAULT_CATEGORIES = [
     "📦 Miscellaneous"
 ]
 
+# Default income categories
+DEFAULT_INCOME_CATEGORIES = [
+    "💰 Salary",
+    "💼 Freelance",
+    "📈 Investments",
+    "🏦 Interest",
+    "🎁 Gifts Received",
+    "💵 Bonus",
+    "🏠 Rental Income",
+    "📊 Dividends",
+    "💻 Side Business",
+    "🎯 Commission",
+    "💸 Refunds",
+    "🎲 Lottery/Winnings",
+    "📦 Other Income"
+]
+
+# Combined for backward compatibility
+DEFAULT_CATEGORIES = DEFAULT_EXPENSE_CATEGORIES
+
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -50,66 +71,63 @@ def hash_password(password: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_engine():
-    user = os.getenv("MYSQL_USER", "root")
-    password = os.getenv("MYSQL_PASSWORD", "")
-    host = os.getenv("MYSQL_HOST", "localhost")
-    port = os.getenv("MYSQL_PORT", "3306")
-    db = os.getenv("MYSQL_DB", "expenses")
-    url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}?charset=utf8mb4"
-    return create_engine(url, pool_pre_ping=True)
+    # Use SQLite for simplicity and cloud deployment
+    url = f"sqlite:///{DB_PATH}"
+    return create_engine(url, connect_args={"check_same_thread": False})
 
 
 def init_db(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS users (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        username VARCHAR(64) NOT NULL UNIQUE,
-        email VARCHAR(128) NOT NULL UNIQUE,
-        password_hash VARCHAR(256) NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS categories (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT,
-        name VARCHAR(64) NOT NULL,
-        color VARCHAR(16) DEFAULT '#38bdf8',
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT NOT NULL,
+        color TEXT DEFAULT '#38bdf8',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY unique_user_category (user_id, name),
+        UNIQUE(user_id, name),
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS transactions (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        transaction_type TEXT DEFAULT 'expense',
         occurred_on DATE NOT NULL,
-        description VARCHAR(255) NOT NULL,
-        category_id INT,
-        payment_method VARCHAR(32) DEFAULT 'card',
+        description TEXT NOT NULL,
+        category_id INTEGER,
+        payment_method TEXT DEFAULT 'card',
         amount DECIMAL(12,2) NOT NULL,
-        tags VARCHAR(255),
-        receipt_url VARCHAR(255),
+        tags TEXT,
+        receipt_url TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
         FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS budgets (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT,
-        category_id INT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        category_id INTEGER,
         month_start DATE NOT NULL,
         monthly_limit DECIMAL(12,2) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE KEY unique_budget (user_id, category_id, month_start),
+        UNIQUE(user_id, category_id, month_start),
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
         FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS savings_goals (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT,
-        goal_name VARCHAR(128) NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        goal_name TEXT NOT NULL,
         target_amount DECIMAL(12,2) NOT NULL,
         current_amount DECIMAL(12,2) DEFAULT 0,
         deadline DATE,
@@ -122,6 +140,15 @@ def init_db(engine):
             if statement.strip():
                 conn.execute(text(statement))
         conn.commit()
+    
+    # Migration: Add transaction_type column if it doesn't exist (for existing databases)
+    with engine.connect() as conn:
+        # Check if transaction_type column exists
+        result = conn.execute(text("PRAGMA table_info(transactions)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "transaction_type" not in columns:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN transaction_type TEXT DEFAULT 'expense'"))
+            conn.commit()
 
 
 def register_user(engine, username: str, email: str, password: str) -> tuple:
@@ -141,7 +168,7 @@ def register_user(engine, username: str, email: str, password: str) -> tuple:
             ).scalar()
         return True, user_id, "Registration successful!"
     except Exception as e:
-        if "Duplicate" in str(e):
+        if "UNIQUE" in str(e).upper() or "Duplicate" in str(e):
             return False, None, "Username or email already exists!"
         return False, None, f"Registration failed: {str(e)}"
 
@@ -247,26 +274,37 @@ def upsert_category(engine, user_id: int, name: str, color: str = "#38bdf8") -> 
     if not name:
         return None
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO categories (user_id, name, color)
-                VALUES (:user_id, :name, :color)
-                ON DUPLICATE KEY UPDATE name = VALUES(name), color = VALUES(color)
-                """
-            ),
-            {"user_id": user_id, "name": name.strip(), "color": color},
-        )
-        cat_id = conn.execute(
+        # Check if category exists
+        existing = conn.execute(
             text("SELECT id FROM categories WHERE user_id = :user_id AND name = :name"),
             {"user_id": user_id, "name": name.strip()}
         ).scalar()
-    return cat_id
+        
+        if existing:
+            conn.execute(
+                text("UPDATE categories SET color = :color WHERE id = :id"),
+                {"color": color, "id": existing}
+            )
+            return existing
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO categories (user_id, name, color)
+                    VALUES (:user_id, :name, :color)
+                """),
+                {"user_id": user_id, "name": name.strip(), "color": color},
+            )
+            cat_id = conn.execute(
+                text("SELECT id FROM categories WHERE user_id = :user_id AND name = :name"),
+                {"user_id": user_id, "name": name.strip()}
+            ).scalar()
+            return cat_id
 
 
 def insert_transaction(
     engine,
     user_id: int,
+    transaction_type: str,
     occurred_on: dt.date,
     description: str,
     amount: float,
@@ -280,12 +318,13 @@ def insert_transaction(
             text(
                 """
                 INSERT INTO transactions
-                (user_id, occurred_on, description, amount, category_id, payment_method, tags, receipt_url)
-                VALUES (:user_id, :occurred_on, :description, :amount, :category_id, :payment_method, :tags, :receipt_url)
+                (user_id, transaction_type, occurred_on, description, amount, category_id, payment_method, tags, receipt_url)
+                VALUES (:user_id, :transaction_type, :occurred_on, :description, :amount, :category_id, :payment_method, :tags, :receipt_url)
                 """
             ),
             {
                 "user_id": user_id,
+                "transaction_type": transaction_type,
                 "occurred_on": occurred_on,
                 "description": description,
                 "amount": amount,
@@ -299,16 +338,25 @@ def insert_transaction(
 
 def upsert_budget(engine, user_id: int, category_id: int, month_start: dt.date, monthly_limit: float):
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO budgets (user_id, category_id, month_start, monthly_limit)
-                VALUES (:user_id, :category_id, :month_start, :monthly_limit)
-                ON DUPLICATE KEY UPDATE monthly_limit = VALUES(monthly_limit)
-                """
-            ),
-            {"user_id": user_id, "category_id": category_id, "month_start": month_start, "monthly_limit": monthly_limit},
-        )
+        # Check if budget exists
+        existing = conn.execute(
+            text("SELECT id FROM budgets WHERE user_id = :user_id AND category_id = :category_id AND month_start = :month_start"),
+            {"user_id": user_id, "category_id": category_id, "month_start": month_start}
+        ).scalar()
+        
+        if existing:
+            conn.execute(
+                text("UPDATE budgets SET monthly_limit = :monthly_limit WHERE id = :id"),
+                {"monthly_limit": monthly_limit, "id": existing}
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO budgets (user_id, category_id, month_start, monthly_limit)
+                    VALUES (:user_id, :category_id, :month_start, :monthly_limit)
+                """),
+                {"user_id": user_id, "category_id": category_id, "month_start": month_start, "monthly_limit": monthly_limit},
+            )
 
 
 def add_savings_goal(engine, user_id: int, goal_name: str, target_amount: float, deadline: dt.date):
@@ -424,21 +472,41 @@ def metric_cards(df: pd.DataFrame):
         df["occurred_on"] = pd.to_datetime(df["occurred_on"])
     
     month_df = df[df["occurred_on"] >= pd.Timestamp(month_start)] if not df.empty else df
-    total_month = month_df["amount"].sum() if not month_df.empty else 0
-    avg_daily = month_df.groupby("occurred_on")["amount"].sum().mean() if not month_df.empty else 0
+    
+    # Separate income and expenses
+    if "transaction_type" in df.columns:
+        expense_df = month_df[month_df["transaction_type"] == "expense"] if not month_df.empty else month_df
+        income_df = month_df[month_df["transaction_type"] == "income"] if not month_df.empty else month_df
+    else:
+        expense_df = month_df
+        income_df = pd.DataFrame()
+    
+    total_expenses = expense_df["amount"].sum() if not expense_df.empty else 0
+    total_income = income_df["amount"].sum() if not income_df.empty else 0
+    net_balance = total_income - total_expenses
+    
+    avg_daily = expense_df.groupby("occurred_on")["amount"].sum().mean() if not expense_df.empty else 0
     total_transactions = len(month_df) if not month_df.empty else 0
     top_cat = (
-        month_df.groupby("category")["amount"].sum().sort_values(ascending=False).reset_index().iloc[0]
-        if not month_df.empty and len(month_df) > 0
+        expense_df.groupby("category")["amount"].sum().sort_values(ascending=False).reset_index().iloc[0]
+        if not expense_df.empty and len(expense_df) > 0
         else None
     )
 
-    cols = st.columns(4)
-    cols[0].metric("💰 This Month", f"{CURRENCY}{total_month:,.2f}", help="Total spending this month")
-    cols[1].metric("📊 Daily Average", f"{CURRENCY}{avg_daily:,.2f}" if not pd.isna(avg_daily) else f"{CURRENCY}0.00", help="Average daily spending")
-    cols[2].metric("📝 Transactions", f"{total_transactions}", help="Number of transactions this month")
-    cols[3].metric(
-        "🏆 Top Category",
+    cols = st.columns(5)
+    cols[0].metric("💰 Income", f"{CURRENCY}{total_income:,.2f}", help="Total income this month")
+    cols[1].metric("💸 Expenses", f"{CURRENCY}{total_expenses:,.2f}", help="Total spending this month")
+    
+    # Net balance with color indicator
+    delta_color = "normal" if net_balance >= 0 else "inverse"
+    cols[2].metric("📊 Net Balance", f"{CURRENCY}{abs(net_balance):,.2f}", 
+                   delta=f"{'Profit' if net_balance >= 0 else 'Loss'}",
+                   delta_color=delta_color,
+                   help="Income minus Expenses")
+    
+    cols[3].metric("📝 Transactions", f"{total_transactions}", help="Number of transactions this month")
+    cols[4].metric(
+        "🏆 Top Expense",
         f"{top_cat['category'].split(' ')[-1] if ' ' in str(top_cat['category']) else top_cat['category']}" if top_cat is not None else "—",
         f"{CURRENCY}{top_cat['amount']:,.0f}" if top_cat is not None else None,
         help="Highest spending category"
@@ -678,61 +746,117 @@ def filter_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_transaction_form(engine, user_id: int, categories: List[str]):
-    # Combine user categories with defaults, removing duplicates
-    all_categories = list(dict.fromkeys(categories + DEFAULT_CATEGORIES))
-    
     with st.expander("➕ Add Transaction", expanded=True):
         st.markdown("""<style>
         .stForm {background: rgba(255,255,255,0.02); border-radius: 12px; padding: 1rem;}
         </style>""", unsafe_allow_html=True)
         
-        with st.form("add_tx"):
-            cols = st.columns(2)
-            occurred_on = cols[0].date_input("📅 Date", dt.date.today())
-            amount = cols[1].number_input(f"💵 Amount ({CURRENCY})", min_value=0.0, step=0.01, format="%.2f")
+        # Transaction type tabs
+        tx_tab1, tx_tab2 = st.tabs(["💸 Expense", "💰 Income"])
+        
+        with tx_tab1:
+            # Combine user categories with expense defaults
+            expense_categories = list(dict.fromkeys(categories + DEFAULT_EXPENSE_CATEGORIES))
             
-            description = st.text_input("📝 Description", placeholder="What did you spend on?")
-            
-            category_name = st.selectbox(
-                "📁 Category", 
-                options=all_categories,
-                help="Select a category or choose Miscellaneous for uncategorized expenses"
-            )
-            
-            col1, col2 = st.columns(2)
-            payment_method = col1.selectbox(
-                "💳 Payment Method", 
-                ["💳 Card", "💵 Cash", "🏦 Bank Transfer", "📱 UPI", "👛 Wallet", "₿ Crypto"]
-            )
-            tags = col2.text_input("🏷️ Tags", placeholder="e.g., urgent, monthly")
-            
-            receipt_url = st.text_input("🔗 Receipt URL (optional)", placeholder="https://...")
+            with st.form("add_expense"):
+                cols = st.columns(2)
+                occurred_on = cols[0].date_input("📅 Date", dt.date.today(), key="exp_date")
+                amount = cols[1].number_input(f"💵 Amount ({CURRENCY})", min_value=0.0, step=0.01, format="%.2f", key="exp_amount")
+                
+                description = st.text_input("📝 Description", placeholder="What did you spend on?", key="exp_desc")
+                
+                category_name = st.selectbox(
+                    "📁 Category", 
+                    options=expense_categories,
+                    help="Select a category for your expense",
+                    key="exp_cat"
+                )
+                
+                col1, col2 = st.columns(2)
+                payment_method = col1.selectbox(
+                    "💳 Payment Method", 
+                    ["💳 Card", "💵 Cash", "🏦 Bank Transfer", "📱 UPI", "👛 Wallet", "₿ Crypto"],
+                    key="exp_payment"
+                )
+                tags = col2.text_input("🏷️ Tags", placeholder="e.g., urgent, monthly", key="exp_tags")
+                
+                receipt_url = st.text_input("🔗 Receipt URL (optional)", placeholder="https://...", key="exp_receipt")
 
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                submitted = st.form_submit_button("💾 Save Transaction", use_container_width=True, type="primary")
-            
-            if submitted:
-                if amount <= 0:
-                    st.error("⚠️ Please enter a valid amount greater than 0")
-                else:
-                    cat_id = upsert_category(engine, user_id, category_name)
-                    # Clean payment method (remove emoji)
-                    clean_payment = payment_method.split(" ", 1)[-1] if " " in payment_method else payment_method
-                    insert_transaction(
-                        engine,
-                        user_id,
-                        occurred_on,
-                        description.strip() or "Untitled",
-                        float(amount),
-                        cat_id,
-                        clean_payment.lower(),
-                        tags,
-                        receipt_url,
-                    )
-                    st.success("✅ Transaction saved successfully!")
-                    st.cache_data.clear()
-                    st.rerun()
+                col1, col2, col3 = st.columns([1, 2, 1])
+                with col2:
+                    submitted = st.form_submit_button("💸 Save Expense", use_container_width=True, type="primary")
+                
+                if submitted:
+                    if amount <= 0:
+                        st.error("⚠️ Please enter a valid amount greater than 0")
+                    else:
+                        cat_id = upsert_category(engine, user_id, category_name)
+                        clean_payment = payment_method.split(" ", 1)[-1] if " " in payment_method else payment_method
+                        insert_transaction(
+                            engine,
+                            user_id,
+                            "expense",
+                            occurred_on,
+                            description.strip() or "Untitled",
+                            float(amount),
+                            cat_id,
+                            clean_payment.lower(),
+                            tags,
+                            receipt_url,
+                        )
+                        st.success("✅ Expense saved successfully!")
+                        st.cache_data.clear()
+                        st.rerun()
+        
+        with tx_tab2:
+            # Income form
+            with st.form("add_income"):
+                cols = st.columns(2)
+                inc_occurred_on = cols[0].date_input("📅 Date", dt.date.today(), key="inc_date")
+                inc_amount = cols[1].number_input(f"💵 Amount ({CURRENCY})", min_value=0.0, step=0.01, format="%.2f", key="inc_amount")
+                
+                inc_description = st.text_input("📝 Description", placeholder="Source of income", key="inc_desc")
+                
+                inc_category_name = st.selectbox(
+                    "📁 Income Source", 
+                    options=DEFAULT_INCOME_CATEGORIES,
+                    help="Select the source of your income",
+                    key="inc_cat"
+                )
+                
+                col1, col2 = st.columns(2)
+                inc_payment_method = col1.selectbox(
+                    "💳 Received Via", 
+                    ["🏦 Bank Transfer", "💵 Cash", "📱 UPI", "💳 Card", "👛 Wallet", "₿ Crypto", "📄 Cheque"],
+                    key="inc_payment"
+                )
+                inc_tags = col2.text_input("🏷️ Tags", placeholder="e.g., monthly, bonus", key="inc_tags")
+
+                col1, col2, col3 = st.columns([1, 2, 1])
+                with col2:
+                    inc_submitted = st.form_submit_button("💰 Save Income", use_container_width=True, type="primary")
+                
+                if inc_submitted:
+                    if inc_amount <= 0:
+                        st.error("⚠️ Please enter a valid amount greater than 0")
+                    else:
+                        cat_id = upsert_category(engine, user_id, inc_category_name)
+                        clean_payment = inc_payment_method.split(" ", 1)[-1] if " " in inc_payment_method else inc_payment_method
+                        insert_transaction(
+                            engine,
+                            user_id,
+                            "income",
+                            inc_occurred_on,
+                            inc_description.strip() or "Income",
+                            float(inc_amount),
+                            cat_id,
+                            clean_payment.lower(),
+                            inc_tags,
+                            "",
+                        )
+                        st.success("✅ Income saved successfully!")
+                        st.cache_data.clear()
+                        st.rerun()
 
 
 def budget_form(engine, user_id: int, categories: List[str]):
@@ -887,6 +1011,7 @@ def main():
         engine,
         f"""
         SELECT t.id, t.occurred_on, t.description, t.amount, t.payment_method, t.tags, t.receipt_url,
+               COALESCE(t.transaction_type, 'expense') AS transaction_type,
                COALESCE(c.name, 'Uncategorized') AS category
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
@@ -981,8 +1106,13 @@ def main():
         if df_tx.empty:
             st.info("No transactions yet. Start adding your expenses!")
         else:
+            # Add type indicator with emoji
+            display_df = df_tx.copy()
+            display_df["type"] = display_df["transaction_type"].apply(
+                lambda x: "💸 Expense" if x == "expense" else "💰 Income"
+            )
             st.dataframe(
-                df_tx[["occurred_on", "description", "category", "amount", "payment_method", "tags", "receipt_url"]],
+                display_df[["occurred_on", "type", "description", "category", "amount", "payment_method", "tags"]],
                 use_container_width=True,
                 hide_index=True,
             )
